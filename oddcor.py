@@ -45,7 +45,7 @@ BASE = "https://api.sportradar.com"
 # ===================== HELPERS =====================
 
 def get_secret(key: str, fallback: str = "") -> str:
-    # Ya no usamos secretos; se reemplaza por UI API_KEY
+    # Usamos API_KEY de la UI
     if key == "SPORTRADAR_API_KEY":
         return API_KEY or fallback
     return fallback(key: str, fallback: str = "") -> str:
