@@ -113,9 +113,9 @@ if do_search:
                 try:
                     payload = fetch_event_markets(ev_id, lang)
                 except requests.HTTPError:
-                    continue(ev_id, lang)
+                    continue
             except requests.HTTPError:
-                continue(ev_id, lang)(ev_id, lang)
+                continue(ev_id, lang)
             except requests.HTTPError:
                     # Sin mercados o sin permisos, saltar
                     continue
