@@ -1,54 +1,61 @@
-# Corners Finder — Totales de Corners (The Odds API v4)
-# -----------------------------------------------------
+# -*- coding: utf-8 -*-
+# Corners Finder — SportMonks (Totales de Corners por línea)
+# ----------------------------------------------------------
 # Reqs: streamlit, requests, pandas, openpyxl
-# Funcionalidad:
-#  - Indicas línea de corners (ej. 8, 8.5, 9)
-#  - Umbral de momio mínimo para Over y Under
-#  - Filtra partidos cuyo mercado alternate_totals_corners tenga esa línea
-#    y cumpla ambos umbrales
-#  - Descarga a Excel (tabla pivotada con Over/Under)
 #
-# Notas:
-#  - Los mercados de corners vienen en odds por EVENTO:
-#      /v4/sports/{sport}/events/{eventId}/odds?markets=alternate_totals_corners
-#  - Fechas deben ir en formato sin microsegundos: YYYY-MM-DDTHH:MM:SSZ
+# ¿Qué hace?
+# - Pides una FECHA (UTC), una LÍNEA de corners (ej. 8 / 8.5 / 9),
+#   y momios mínimos para Over y Under.
+# - Consulta fixtures del día en SportMonks y trae odds de "Alternative Corners" (market_id=69).
+# - Filtra partidos donde exista esa LÍNEA y cumplan Over ≥ X y Under ≥ Y.
+# - Muestra tabla pivotada (Over / Under por bookmaker) y permite descargar a Excel.
+#
+# Docs clave:
+# - GET fixtures by date: /v3/football/fixtures/date/{date}
+# - include=odds y filtros de mercados: &include=odds&filters=markets:69
+# - Mercado "Alternative Corners": id=69
+#
+# Autor: tú + ChatGPT :)
 
 import io
 import time
-from typing import Iterable, List, Dict, Any
-from datetime import datetime, date, time as dtime, timezone
+from typing import Any, Dict, Iterable, List
+from datetime import date as ddate
 
 import pandas as pd
 import requests
 import streamlit as st
 
-API_BASE = "https://api.the-odds-api.com/v4"
+API_FOOTBALL_BASE = "https://api.sportmonks.com/v3/football"
+MARKET_ID_ALTERNATIVE_CORNERS = 69  # "Alternative Corners"
 
-# ===================== UI BASE =====================
-st.set_page_config(page_title="Corners — Totales (The Odds API)", page_icon="⚽", layout="wide")
-st.title("⚽ Corners Finder — Totales de Corners (The Odds API v4)")
+# --------------------------- UI ---------------------------
+st.set_page_config(page_title="Corners Finder — SportMonks", page_icon="⚽", layout="wide")
+st.title("⚽ Corners Finder — SportMonks (Totales de corners)")
 
 with st.sidebar:
     st.header("🔑 Configuración API")
-    api_key = st.text_input("API key (The Odds API)", type="password")
-    odds_format = st.selectbox("Formato de momios", ["decimal", "american"], index=0)
-    regions = st.multiselect("Regiones (bookmakers)", ["uk", "eu", "us", "us2", "au"], default=["uk", "eu"])
-    the_day = st.date_input("Fecha (UTC)", value=date.today(), help="Ventana 00:00:00–23:59:59 UTC")
+    api_token = st.text_input("API token (SportMonks)", type="password")
 
-    st.header("🎯 Filtro — Totales de corners")
+    st.header("📅 Fecha & Filtros")
+    the_day: ddate = st.date_input("Fecha (UTC)", value=ddate.today(), help="Ventana del día entero en UTC")
+
     corners_line = st.number_input("Línea de corners (ej. 8, 8.5, 9)", min_value=0.0, step=0.5, value=8.0, format="%.2f")
     over_min = st.number_input("Momio mínimo Over (≥)", min_value=0.0, step=0.05, value=2.0, format="%.2f")
     under_min = st.number_input("Momio mínimo Under (≥)", min_value=0.0, step=0.05, value=2.0, format="%.2f")
 
+    # Opcional: limitar por ligas (IDs separados por coma). Si lo dejas vacío, trae todas.
+    leagues_csv = st.text_input("Ligas (IDs separadas por coma) — opcional", value="")
+    # Opcional: limitar bookies por IDs
+    bookmakers_csv = st.text_input("Bookmakers (IDs separadas por coma) — opcional", value="")
+
     fetch_btn = st.button("🔎 Buscar partidos que cumplan")
 
-# ===================== Helpers =====================
-def _headers() -> Dict[str, str]:
-    return {"Accept": "application/json"}
-
+# --------------------------- Helpers ---------------------------
 def _get(url: str, params: Dict[str, Any], retries: int = 2, backoff: float = 0.7) -> Any:
+    """GET con reintentos básicos para 429/5xx."""
     for i in range(retries + 1):
-        r = requests.get(url, params=params, headers=_headers(), timeout=30)
+        r = requests.get(url, params=params, timeout=30)
         if r.status_code == 200:
             try:
                 return r.json()
@@ -59,216 +66,181 @@ def _get(url: str, params: Dict[str, Any], retries: int = 2, backoff: float = 0.
             continue
         raise RuntimeError(f"{r.status_code} {r.text}")
 
-def iso_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-@st.cache_data(ttl=1200, show_spinner=False)
-def list_soccer_sports(api_key: str) -> List[Dict[str, Any]]:
-    url = f"{API_BASE}/sports"
-    data = _get(url, {"apiKey": api_key, "all": "true"})
-    soccer = [s for s in data if "Soccer" in s.get("group", "")]
-    soccer_sorted = sorted(soccer, key=lambda x: (not x.get("active", False), x.get("title", "")))
-    return soccer_sorted
-
-@st.cache_data(ttl=600, show_spinner=False)
-def list_events_for_sport(api_key: str, sport_key: str, commence_from_iso: str, commence_to_iso: str) -> List[Dict[str, Any]]:
-    url = f"{API_BASE}/sports/{sport_key}/events"
-    params = {"apiKey": api_key, "commenceTimeFrom": commence_from_iso, "commenceTimeTo": commence_to_iso}
-    data = _get(url, params)
-    return data if isinstance(data, list) else []
-
-def fetch_event_totals_corners(api_key: str, sport_key: str, event_id: str, regions_csv: str, odds_format: str) -> Any:
-    url = f"{API_BASE}/sports/{sport_key}/events/{event_id}/odds"
+def fetch_fixtures_with_corners(
+    api_token: str,
+    day: ddate,
+    leagues_csv: str = "",
+    bookmakers_csv: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Trae fixtures del día con odds incluidas y filtradas al mercado 'Alternative Corners' (id=69).
+    Usa: GET /v3/football/fixtures/date/{date}?include=odds&filters=markets:69
+    Opcional: &filters=fixtureLeagues:{ids} y &filters=bookmakers:{ids}
+    """
+    url = f"{API_FOOTBALL_BASE}/fixtures/date/{day.isoformat()}"
     params = {
-        "apiKey": api_key,
-        "regions": regions_csv,
-        "markets": "alternate_totals_corners",
-        "oddsFormat": odds_format,
-        "dateFormat": "iso",
+        "api_token": api_token,
+        "include": "odds,participants",  # participants para mostrar nombres si se requieren
+        # Filtros de odds:
+        "filters": f"markets:{MARKET_ID_ALTERNATIVE_CORNERS}",
     }
+
+    # Agregar filtros opcionales de ligas y bookmakers
+    extra_filters = []
+    if leagues_csv.strip():
+        extra_filters.append(f"fixtureLeagues:{leagues_csv.strip()}")
+    if bookmakers_csv.strip():
+        extra_filters.append(f"bookmakers:{bookmakers_csv.strip()}")
+
+    if extra_filters:
+        if params["filters"]:
+            params["filters"] = params["filters"] + "," + ",".join(extra_filters)
+        else:
+            params["filters"] = ",".join(extra_filters)
+
+    data = _get(url, params)
+    return data.get("data", []) if isinstance(data, dict) else []
+
+def participants_to_vs_name(fx: Dict[str, Any]) -> str:
+    """Intenta devolver 'Team A vs Team B' desde participants; si no, usa fx['name']."""
     try:
-        return _get(url, params)
+        parts = fx.get("participants", {}).get("data", [])
+        names = [p.get("name") for p in parts if isinstance(p, dict)]
+        if len(names) >= 2:
+            return f"{names[0]} vs {names[1]}"
     except Exception:
-        return []
+        pass
+    return fx.get("name") or f"Fixture {fx.get('id')}"
 
-def iter_bookmakers(resp: Any) -> Iterable[Dict[str, Any]]:
-    if isinstance(resp, list):
-        for bk in resp:
-            if isinstance(bk, dict):
-                yield bk
-    elif isinstance(resp, dict):
-        bks = resp.get("bookmakers") or resp.get("bookmaker") or []
-        if isinstance(bks, list):
-            for bk in bks:
-                if isinstance(bk, dict):
-                    yield bk
-
-def flatten_totals_rows(event: Dict[str, Any], bookmaker: Dict[str, Any], market: Dict[str, Any]) -> List[Dict[str, Any]]:
-    rows = []
-    outcomes = market.get("outcomes") if isinstance(market, dict) else None
-    if not isinstance(outcomes, list):
-        return rows
-    for o in outcomes:
-        if not isinstance(o, dict):
-            continue
-        rows.append({
-            "event_id": event.get("id"),
-            "commence_time": event.get("commence_time"),
-            "home_team": event.get("home_team"),
-            "away_team": event.get("away_team"),
-            "bookmaker": bookmaker.get("title"),
-            "market_key": market.get("key"),
-            "outcome_name": o.get("name"),   # "Over" o "Under"
-            "point": o.get("point"),         # línea (ej. 8, 8.5, 9)
-            "price": o.get("price"),
-            "last_update": bookmaker.get("last_update"),
-        })
-    return rows
-
-# ===================== Ligas / selección =====================
-chosen_sports: List[str] = []
-if api_key:
-    try:
-        soccer_list = list_soccer_sports(api_key)
-        with st.expander("⚙️ Ligas/competiciones de Soccer (The Odds API)"):
-            default_keys = [
-                s["key"] for s in soccer_list
-                if s.get("active") and any(
-                    kw in s.get("title", "").lower()
-                    for kw in ["premier", "la liga", "serie a", "bundesliga", "ligue 1", "mls"]
-                )
-            ]
-            options = {f'{s["title"]} — {s["key"]}': s["key"] for s in soccer_list}
-            chosen_labels = st.multiselect(
-                "Selecciona ligas (puedes dejar vacío y usar 'upcoming')",
-                list(options.keys()),
-                default=[lbl for lbl in options if options[lbl] in default_keys][:6]
-            )
-            chosen_sports = [options[lbl] for lbl in chosen_labels]
-            use_upcoming = st.checkbox("Usar sport = 'upcoming' (próximos/en vivo)", value=False)
-            if use_upcoming or not chosen_sports:
-                chosen_sports = ["upcoming"]
-    except Exception as e:
-        st.warning(f"No pude listar ligas: {e}")
-else:
-    st.info("Ingresa tu API key para listar ligas y eventos.")
-
-# ===================== Búsqueda principal =====================
+# --------------------------- Main ---------------------------
 if fetch_btn:
-    if not api_key:
-        st.error("Falta API key.")
-        st.stop()
-    if not regions:
-        st.error("Selecciona al menos una región.")
+    if not api_token:
+        st.error("Falta API token.")
         st.stop()
 
-    regions_csv = ",".join(regions)
-    start_dt = datetime.combine(the_day, dtime(0, 0, 0, tzinfo=timezone.utc))
-    end_dt   = datetime.combine(the_day, dtime(23, 59, 59, tzinfo=timezone.utc))
-    start_iso = iso_utc(start_dt)
-    end_iso   = iso_utc(end_dt)
+    st.write(
+        f"🔍 Buscando **totales de corners** (market_id {MARKET_ID_ALTERNATIVE_CORNERS}) "
+        f"para **{the_day.isoformat()}**…"
+    )
 
-    st.write(f"🔍 Buscando *totales de corners* entre **{start_iso}** y **{end_iso}** en {', '.join(chosen_sports)} …")
-
-    all_rows: List[Dict[str, Any]] = []
-    total_events = 0
-    events_with_totals = 0
-
-    for sport in chosen_sports:
-        try:
-            events = list_events_for_sport(api_key, sport, start_iso, end_iso)
-        except Exception as e:
-            st.warning(f"[{sport}] No pude obtener eventos: {e}")
-            events = []
-
-        for ev in events:
-            total_events += 1
-            resp = fetch_event_totals_corners(api_key, sport, ev.get("id"), regions_csv, odds_format)
-            had_totals = False
-            for bk in iter_bookmakers(resp):
-                markets = bk.get("markets") if isinstance(bk, dict) else None
-                if not isinstance(markets, list):
-                    continue
-                for m in markets:
-                    if not isinstance(m, dict):
-                        continue
-                    if m.get("key") == "alternate_totals_corners":
-                        rows = flatten_totals_rows(ev, bk, m)
-                        if rows:
-                            had_totals = True
-                            all_rows.extend(rows)
-            if had_totals:
-                events_with_totals += 1
-
-    st.write(f"Eventos inspeccionados: **{total_events}** — con totales de corners: **{events_with_totals}**")
-
-    if not all_rows:
-        st.warning("No se encontraron **totales de corners** para la selección. Prueba otras ligas/regiones u otra fecha.")
+    try:
+        fixtures = fetch_fixtures_with_corners(api_token, the_day, leagues_csv, bookmakers_csv)
+    except Exception as e:
+        st.error(f"No pude obtener fixtures: {e}")
         st.stop()
 
-    df = pd.DataFrame(all_rows)
-    # Asegurar tipos numéricos
-    df["point"] = pd.to_numeric(df["point"], errors="coerce")
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    if not fixtures:
+        st.warning("No se encontraron fixtures para esa fecha (o tu plan no incluye odds).")
+        st.stop()
 
-    # --- Filtro por LÍNEA exacta + umbrales Over/Under ---
-    target = float(corners_line)
+    rows: List[Dict[str, Any]] = []
+    for fx in fixtures:
+        fx_id = fx.get("id")
+        fx_name = participants_to_vs_name(fx)
+        start_at = fx.get("starting_at")
+        odds = fx.get("odds", {}).get("data", []) if isinstance(fx.get("odds"), dict) else []
 
-    # Nos quedamos con esa línea exacta
-    df_line = df[(df["market_key"] == "alternate_totals_corners") & (df["point"] == target)].copy()
+        # Cada 'odd' es un registro del mercado con campos: market_id, bookmaker_id, label/name (Over/Under), value, total, etc.
+        for odd in odds:
+            if odd.get("market_id") != MARKET_ID_ALTERNATIVE_CORNERS:
+                continue
+
+            # Convertir tipos
+            total = None
+            try:
+                total = float(odd.get("total")) if odd.get("total") is not None else None
+            except Exception:
+                total = None
+
+            price = None
+            try:
+                price = float(odd.get("value"))
+            except Exception:
+                price = None
+
+            if total is None or price is None:
+                continue
+
+            rows.append(
+                {
+                    "fixture_id": fx_id,
+                    "match": fx_name,
+                    "starting_at": start_at,
+                    "bookmaker_id": odd.get("bookmaker_id"),
+                    "market_id": odd.get("market_id"),
+                    "label": odd.get("label") or odd.get("name"),  # "Over" / "Under"
+                    "total": total,  # línea
+                    "price": price,  # momio
+                }
+            )
+
+    if not rows:
+        st.warning("No recibí cuotas de corners en 'Alternative Corners' para esa fecha.")
+        st.stop()
+
+    df = pd.DataFrame(rows)
+
+    # Filtrar por la línea elegida
+    target_line = float(corners_line)
+    df_line = df[df["total"] == target_line].copy()
 
     if df_line.empty:
-        st.warning(f"No hay cuotas para la **línea {target}** en los mercados de totales de corners.")
+        st.warning(f"No hay cuotas para la **línea {target_line}** en 'Alternative Corners'.")
         st.stop()
 
-    # Pivotar Over/Under por evento-bookmaker (una fila por combinacion)
+    # Pivotar Over/Under por fixture+bookmaker
     pivot = (
         df_line.pivot_table(
-            index=["event_id", "commence_time", "home_team", "away_team", "bookmaker", "point"],
-            columns="outcome_name",
+            index=["fixture_id", "match", "starting_at", "bookmaker_id", "total"],
+            columns="label",
             values="price",
-            aggfunc="first"
+            aggfunc="first",
         )
         .reset_index()
     )
 
-    # Normalizar nombres de columnas (por si falta alguno)
-    cols = list(pivot.columns)
-    if "Over" not in cols: pivot["Over"] = pd.NA
-    if "Under" not in cols: pivot["Under"] = pd.NA
+    # Asegurar columnas Over/Under
+    if "Over" not in pivot.columns:
+        pivot["Over"] = pd.NA
+    if "Under" not in pivot.columns:
+        pivot["Under"] = pd.NA
 
-    # Filtro por umbrales
+    # Filtros de momio
     filtered = pivot[
-        (pd.to_numeric(pivot["Over"], errors="coerce") >= over_min) &
-        (pd.to_numeric(pivot["Under"], errors="coerce") >= under_min)
+        (pd.to_numeric(pivot["Over"], errors="coerce") >= float(over_min))
+        & (pd.to_numeric(pivot["Under"], errors="coerce") >= float(under_min))
     ].copy()
 
     if filtered.empty:
-        st.warning(f"No hay partidos con **línea {target}** donde Over ≥ {over_min} y Under ≥ {under_min}.")
+        st.warning(f"No hay partidos con **línea {target_line}** donde Over ≥ {over_min} y Under ≥ {under_min}.")
         st.stop()
 
-    # Ordenar por fecha y, opcional, por el mayor de Over/Under descendente
+    # Orden sugerida: por fecha y por el mayor de Over/Under desc
     filtered["max_price"] = filtered[["Over", "Under"]].max(axis=1, numeric_only=True)
-    filtered = filtered.sort_values(by=["commence_time", "max_price"], ascending=[True, False])
+    filtered = filtered.sort_values(by=["starting_at", "max_price"], ascending=[True, False])
 
-    st.subheader("Resultados — Totales de corners")
-    st.caption(f"Mostrando línea **{target}** con Over ≥ **{over_min}** y Under ≥ **{under_min}**.")
+    st.subheader("Resultados — Totales de corners (Alternative Corners)")
+    st.caption(
+        f"Línea **{target_line}** — Over ≥ **{over_min}**, Under ≥ **{under_min}**."
+        + ("  (Filtrado por ligas: " + leagues_csv + ")" if leagues_csv.strip() else "")
+        + ("  (Bookmakers: " + bookmakers_csv + ")" if bookmakers_csv.strip() else "")
+    )
     st.dataframe(filtered, use_container_width=True, hide_index=True)
 
-    # Descarga a Excel
-    file_name = f"corners_totales_L{str(target).replace('.','_')}_{the_day.isoformat()}.xlsx"
+    # Descarga Excel
+    file_name = f"smonks_corners_L{str(target_line).replace('.','_')}_{the_day.isoformat()}.xlsx"
     with io.BytesIO() as buffer:
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            filtered.to_excel(writer, index=False, sheet_name="totales_corners")
+            filtered.to_excel(writer, index=False, sheet_name="corners_alt")
         st.download_button(
             "⬇️ Descargar Excel",
             data=buffer.getvalue(),
             file_name=file_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    # Métricas rápidas
+    # Métricas
     c1, c2, c3 = st.columns(3)
-    c1.metric("Partidos (filas)", f"{len(filtered):,}")
-    c2.metric("Bookmakers únicos", filtered["bookmaker"].nunique())
-    c3.metric("Eventos únicos", filtered["event_id"].nunique())
+    c1.metric("Filas", f"{len(filtered):,}")
+    c2.metric("Bookmakers únicos", filtered["bookmaker_id"].nunique())
+    c3.metric("Eventos únicos", filtered["fixture_id"].nunique())
