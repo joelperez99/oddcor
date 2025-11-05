@@ -84,28 +84,6 @@ if do_ping:
 if do_search:
     try:
         if DEMO_MODE:
-            # Datos simulados para validar UI
-            events = [
-                {"sport_event_id": "demo:1", "start_time": f"{sr_date(fecha)}T18:00:00Z", "status": "not_started", "competitors": [], "tournament": "Demo League"},
-            ]
-        else:
-            events = list_daily_events(fecha, lang)
-        st.write(f"Eventos encontrados: {len(events)}")
-        all_rows: list[dict] = []
-
-        # Preparar filtro de casas de apuestas
-        allowed_books: set[str] | None = None
-        if books_filter_text.strip():
-            allowed_books = {b.strip() for b in books_filter_text.split(",") if b.strip()}
-
-        progress = st.progress(0)
-        for idx, ev in enumerate(events):
-            progress.progress((idx + 1) / max(1, len(events)))
-            ev_id = ev["sport_event_id"]
-            if not ev_id:
-                continue
-            try:
-                if DEMO_MODE:
                 payload = {
                     "sport_event": {"id": ev_id, "start_time": f"{sr_date(fecha)}T18:00:00Z", "tournament": {"name": "Demo League"},
                                      "competitors": [{"name": "Equipo A", "qualifier": "home"}, {"name": "Equipo B", "qualifier": "away"}]},
@@ -117,7 +95,7 @@ if do_search:
                     ]
                 }
             else:
-                payload = fetch_event_markets(ev_id, lang)
+                payload = fetch_event_markets(ev_id, lang)(ev_id, lang)
             except requests.HTTPError as http_err:
                 # Si el endpoint no tiene mercados aún o no hay permisos, seguimos
                 continue
