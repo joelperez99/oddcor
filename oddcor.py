@@ -1,16 +1,15 @@
-# Streamlit — Corners Finder usando RapidAPI (Football Betting Odds - betodds)
-# ---------------------------------------------------------------------------
+# Streamlit — Corners Finder con autodetección de endpoint (RapidAPI betodds)
+# ----------------------------------------------------------------------------
 # Requisitos: streamlit, requests, pandas, openpyxl
-# Docs/Playground: RapidAPI "football-betting-odds1" (betodds)
-# - Endpoints vistos en el Playground: /{provider}/live/inplaying y /{provider}/live/upcoming
-#   (usamos estos y hacemos parsing robusto del JSON para detectar "corner"). 
-# NOTA: Si el proveedor no publica mercados de corners, verás una advertencia.
+# - Evita 404 probando múltiples rutas comunes: /{provider}/upcoming, /inplay, /prematch, etc.
+# - Permite escribir una "Ruta personalizada" por si tu plan/proveedor usa un path distinto.
+# - Filtra por mercados/selecciones que contengan "corner" (si el feed los publica).
 
 import io
 import re
 import json
 from datetime import datetime, date
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import requests
@@ -18,32 +17,52 @@ import streamlit as st
 
 # ===================== CONFIG =====================
 st.set_page_config(page_title="Corners Finder — RapidAPI betodds", page_icon="⚽", layout="wide")
-
-DEFAULT_HOST = "football-betting-odds1.p.rapidapi.com"  # Host de RapidAPI para este proveedor
-TIMEOUT = 15
+DEFAULT_HOST = "football-betting-odds1.p.rapidapi.com"
+TIMEOUT = 20
 
 # ===================== SIDEBAR =====================
 st.sidebar.title("⚙️ Config - RapidAPI (betodds)")
 rapidapi_key = st.sidebar.text_input("X-RapidAPI-Key", type="password")
 rapidapi_host = st.sidebar.text_input("X-RapidAPI-Host", value=DEFAULT_HOST)
+provider = st.sidebar.text_input("Provider (ej. bet365, pinnacle, bwin)", value="bet365")
 
-# El API organiza rutas tipo /{provider}/live/inplaying y /{provider}/live/upcoming.
-# Dejamos el provider configurable (ejemplos a probar: bet365, pinnacle, bwin, williamhill, etc. si el feed los soporta)
-provider = st.sidebar.text_input("Provider (segmento de ruta)", value="bet365")
+endpoint_mode = st.sidebar.selectbox(
+    "Modo de endpoint",
+    ["Autodetectar", "Elegir de lista", "Ruta personalizada"],
+    index=0
+)
 
-mode = st.sidebar.selectbox("Tipo de feed", ["upcoming", "inplaying"], index=0)
+preset_endpoint = st.sidebar.selectbox(
+    "Si eliges 'Elegir de lista', selecciona:",
+    [
+        "{provider}/upcoming",
+        "{provider}/inplay",
+        "{provider}/prematch",
+        "{provider}/fixtures",
+        "{provider}/events",
+        "{provider}/live",
+        "{provider}/live/inplay",
+        "{provider}/live/upcoming",
+        "{provider}/pre-match",
+        "{provider}/odds",  # a veces listado general de odds
+    ],
+    index=0
+)
+
+custom_path = st.sidebar.text_input(
+    "Ruta personalizada (sin https://HOST/). Ej.: bet365/upcoming",
+    value=""
+)
+
 league_filter = st.sidebar.text_input("Filtrar por liga (contiene)", value="")
 team_filter = st.sidebar.text_input("Filtrar por equipo (contiene)", value="")
 demo_mode = st.sidebar.toggle("Modo demo (sin API)")
-
-st.sidebar.caption(
-    "Tip: Si recibes 403/404, revisa tu suscripción en RapidAPI, el provider, y que uses la cabecera Host correcta."
-)
+st.sidebar.caption("Usa el Playground de RapidAPI para confirmar la ruta exacta si tu plan la expone.")
 
 # ===================== UI PRINCIPAL =====================
 st.title("⚽ Buscador de mercados de corners — RapidAPI (betodds)")
 sel_date = st.date_input("Fecha de referencia (solo UI)", value=date.today())
-min_line = st.number_input("Filtro: 'Local arriba de…' (numérico detectado en selección)", 0.0, 15.0, step=0.5, value=2.0)
+min_line = st.number_input("Filtro: 'Local arriba de…' (heurístico numérico en selección)", 0.0, 15.0, step=0.5, value=2.0)
 btn_search = st.button("🔍 Buscar partidos y odds")
 
 # ===================== DEMO DATA =====================
@@ -93,71 +112,103 @@ def headers() -> Dict[str, str]:
         "accept": "application/json",
     }
 
-def get_url() -> str:
-    # p.ej. https://football-betting-odds1.p.rapidapi.com/bet365/live/upcoming
-    path = "live/inplaying" if mode == "inplaying" else "live/upcoming"
-    return f"https://{rapidapi_host}/{provider}/{path}"
+def compose_candidates() -> List[str]:
+    """
+    Construye una lista de posibles rutas a probar.
+    """
+    base = provider.strip().strip("/")
+    candidates = [
+        f"{base}/upcoming",
+        f"{base}/inplay",
+        f"{base}/prematch",
+        f"{base}/fixtures",
+        f"{base}/events",
+        f"{base}/live",
+        f"{base}/live/inplay",
+        f"{base}/live/upcoming",
+        f"{base}/pre-match",
+        f"{base}/odds",
+    ]
+    return candidates
 
-def fetch_matches() -> List[Dict[str, Any]]:
-    url = get_url()
-    r = requests.get(url, headers=headers(), timeout=TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    # El esquema varía; intentamos normalizar algunas claves comunes
-    # Buscamos lista de partidos en data o en alguna clave (fixtures, events, matches).
+def pick_endpoint_path() -> Tuple[str, List[str]]:
+    """
+    Devuelve (path_seleccionado, lista_de_paths_probados).
+    """
+    if endpoint_mode == "Ruta personalizada":
+        path = custom_path.strip().strip("/")
+        return path, [path] if path else []
+    elif endpoint_mode == "Elegir de lista":
+        path = preset_endpoint.format(provider=provider).strip().strip("/")
+        return path, [path]
+    else:  # Autodetectar
+        cands = compose_candidates()
+        return "", cands
+
+def probe_first_working_path(paths: List[str]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Prueba una lista de rutas y devuelve la primera que responda 200 con un JSON usable.
+    Regresa (path_ok, payload_json). Si ninguna sirve, path_ok = "".
+    """
+    for path in paths:
+        url = f"https://{rapidapi_host}/{path}"
+        try:
+            r = requests.get(url, headers=headers(), timeout=TIMEOUT)
+            if r.status_code == 200:
+                # Intentamos parsear JSON
+                j = r.json()
+                return path, j
+        except Exception:
+            pass
+    return "", {}
+
+def normalize_matches(data: Any) -> List[Dict[str, Any]]:
+    # Intenta devolver lista de partidos desde un JSON variable
     if isinstance(data, list):
         return data
-    for key in ("matches", "events", "fixtures", "data", "result"):
-        if isinstance(data, dict) and key in data and isinstance(data[key], list):
-            return data[key]
-    # Si llega un objeto por partido (raro), lo envolvemos:
     if isinstance(data, dict):
-        return [data]
+        for k in ("matches", "events", "fixtures", "data", "result"):
+            if isinstance(data.get(k), list):
+                return data[k]
+        # Si luce como un partido suelto:
+        if any(k in data for k in ("homeTeam", "home_team", "home")) and any(k in data for k in ("awayTeam", "away_team", "away")):
+            return [data]
     return []
 
-def fetch_odds_for_match(match: Dict[str, Any]) -> List[Dict[str, Any]]:
+def guess_odds_block(match: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Algunas implementaciones exponen odds dentro del mismo objeto de match.
-    En otras, necesitas llamar otro endpoint con el id del fixture. 
-    Para generalidad:
-      1) Si el match ya trae 'odds' o 'markets', úsalo.
-      2) Si vemos un id razonable, intentamos un segundo endpoint común:
-         /{provider}/odds/{match_id}  (heurística)
+    Devuelve lista de bloques de odds si vienen incrustadas en el match.
     """
-    # 1) ¿Ya trae odds?
     for k in ("odds", "markets", "bookmakers"):
-        if k in match and isinstance(match[k], list):
+        if isinstance(match.get(k), list):
             return match[k]
+    return []
 
-    # 2) Intento heurístico por id
-    match_id = (
-        match.get("id")
-        or match.get("matchId")
-        or match.get("fixtureId")
-        or match.get("eventId")
-    )
-    if match_id:
-        # Probaremos algunas rutas conocidas. Si falla, devolvemos [] sin romper.
-        candidate_paths = [
-            f"https://{rapidapi_host}/{provider}/odds/{match_id}",
-            f"https://{rapidapi_host}/{provider}/prematch/odds/{match_id}",
-            f"https://{rapidapi_host}/{provider}/live/odds/{match_id}",
-        ]
-        for url in candidate_paths:
-            try:
-                r = requests.get(url, headers=headers(), timeout=TIMEOUT)
-                if r.status_code == 200:
-                    j = r.json()
-                    if isinstance(j, list):
-                        return j
-                    for k in ("odds", "markets", "bookmakers", "data", "result"):
-                        if isinstance(j, dict) and k in j:
-                            val = j[k]
-                            if isinstance(val, list):
-                                return val
-            except Exception:
-                pass
-
+def try_fetch_odds_by_id(match: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Si el match no trae odds, intenta rutas por id.
+    """
+    match_id = (match.get("id") or match.get("matchId") or match.get("fixtureId") or match.get("eventId"))
+    if not match_id:
+        return []
+    id_paths = [
+        f"{provider.strip().strip('/')}/odds/{match_id}",
+        f"{provider.strip().strip('/')}/prematch/odds/{match_id}",
+        f"{provider.strip().strip('/')}/live/odds/{match_id}",
+    ]
+    for p in id_paths:
+        url = f"https://{rapidapi_host}/{p}"
+        try:
+            r = requests.get(url, headers=headers(), timeout=TIMEOUT)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, list):
+                    return j
+                for k in ("odds", "markets", "bookmakers", "data", "result"):
+                    if isinstance(j, dict) and isinstance(j.get(k), list):
+                        return j[k]
+        except Exception:
+            pass
     return []
 
 def to_str(x: Any) -> str:
@@ -171,77 +222,57 @@ def to_str(x: Any) -> str:
 
 def pick_first(*keys, src: Dict[str, Any], default="") -> Any:
     for k in keys:
-        if k in src and src[k]:
+        if k in src and src[k] not in (None, ""):
             return src[k]
     return default
 
 def parse_dt(s: str) -> str:
-    # Devuelve ISO legible si se puede
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S %Z")
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return s
 
 def extract_corner_rows(match: Dict[str, Any], odds_block: List[Dict[str, Any]], min_line: float) -> List[Dict[str, Any]]:
-    """
-    Recorre estructura genérica:
-    - Soporta claves comunes: book / bookmaker / key / market / name / selections / outcomes / odds / price
-    - Selección si el nombre del mercado contiene "corner".
-    - Filtro "Local arriba de …": intenta detectar un número en la selección y lo compara con min_line.
-      (Es heurstico: si la selección contiene "Over 2.5", detectamos 2.5).
-    """
-    rows = []
-
+    rows: List[Dict[str, Any]] = []
     home = pick_first("homeTeam", "home_team", "home", src=match, default="")
     away = pick_first("awayTeam", "away_team", "away", src=match, default="")
     league = pick_first("league", "competition", "tournament", src=match, default="")
+    match_id = pick_first("id", "matchId", "fixtureId", "eventId", src=match, default="")
+    start_time = parse_dt(pick_first("startTime", "commence_time", "start_time", "kickoff", src=match, default=""))
 
     def has_corners(text: str) -> bool:
         return "corner" in (text or "").lower()
 
-    # Algunas respuestas usan "bookmakers" -> [{"title":..., "markets":[...]}]
-    # Otras usan lista plana de "markets".
     candidates = odds_block if isinstance(odds_block, list) else []
-
     for book in candidates:
         book_name = pick_first("book", "bookmaker", "title", "name", src=book, default="")
         markets = []
         if "markets" in book and isinstance(book["markets"], list):
             markets = book["markets"]
         else:
-            # a veces el propio 'book' ya es un market (si la API no separa por book)
+            # a veces el propio 'book' es el market
             if any(k in book for k in ("key", "market", "name", "type")):
                 markets = [book]
 
         for m in markets:
             m_name = pick_first("key", "market", "name", "type", src=m, default="")
-            if not has_corners(m_name):
-                # Quizá el key no dice corner pero las selecciones sí
-                # Entonces miramos igual las selecciones y solo guardamos lo que diga corner.
-                pass
-
-            # outcomes/selections
             outs = []
             for k in ("selections", "outcomes", "bets", "options"):
-                if k in m and isinstance(m[k], list):
+                if isinstance(m.get(k), list):
                     outs = m[k]
                     break
-
             for o in outs:
                 sel_name = pick_first("name", "label", "selection", "outcome", src=o, default="")
-                # ¿Alguna parte menciona corners?
                 if not (has_corners(m_name) or has_corners(sel_name)):
                     continue
 
-                # odds/price
                 odds_val = None
                 for ok in ("odds", "price", "decimal", "value", "coeff"):
                     if ok in o and isinstance(o[ok], (int, float)):
                         odds_val = float(o[ok])
                         break
 
-                # Heurística para "Local arriba de …": buscamos el primer número tipo 2 o 2.5
-                # dentro del nombre de la selección. Si existe y >= min_line, lo retenemos.
+                # Heurística: si la selección tiene un número, exigir >= min_line
                 numbers = re.findall(r"\d+(?:\.\d+)?", to_str(sel_name))
                 pass_min = True
                 if numbers:
@@ -250,33 +281,52 @@ def extract_corner_rows(match: Dict[str, Any], odds_block: List[Dict[str, Any]],
                         pass_min = first_num >= float(min_line)
                     except Exception:
                         pass_min = True
-
                 if not pass_min:
                     continue
 
                 rows.append({
-                    "match_id": pick_first("id", "matchId", "fixtureId", "eventId", src=match, default=""),
-                    "start_time": parse_dt(pick_first("startTime", "commence_time", "start_time", "kickoff", src=match, default="")),
+                    "match_id": match_id,
+                    "start_time": start_time,
                     "league": league,
-                    "home": home, "away": away,
+                    "home": home,
+                    "away": away,
                     "book": book_name,
                     "market": m_name,
                     "selection": sel_name,
-                    "odds": odds_val,
+                    "odds": odds_val
                 })
-
     return rows
 
 # ===================== ACTION =====================
 if btn_search:
     try:
         if demo_mode:
-            matches = DEMO_MATCHES
+            path_used = "(demo)"
+            raw_payload = DEMO_MATCHES
         else:
             need_key()
-            matches = fetch_matches()
+            chosen_path, to_probe = pick_endpoint_path()
 
-        # Filtros por liga/equipo (contiene)
+            if endpoint_mode == "Autodetectar":
+                path_used, raw_payload = probe_first_working_path(to_probe)
+                if not path_used:
+                    raise RuntimeError(
+                        "No se encontró un endpoint válido. Prueba 'Ruta personalizada' "
+                        "o confirma el path exacto en el Playground de RapidAPI."
+                    )
+            else:
+                # Usar el seleccionado/escrito y hacer un GET
+                path_used = chosen_path
+                if not path_used:
+                    raise ValueError("Ruta personalizada vacía.")
+                url = f"https://{rapidapi_host}/{path_used}"
+                r = requests.get(url, headers=headers(), timeout=TIMEOUT)
+                r.raise_for_status()
+                raw_payload = r.json()
+
+        matches = normalize_matches(raw_payload)
+
+        # Filtros
         if league_filter:
             matches = [m for m in matches if league_filter.lower() in to_str(m.get("league") or m.get("competition") or "").lower()]
         if team_filter:
@@ -286,6 +336,7 @@ if btn_search:
                 return team_filter.lower() in h.lower() or team_filter.lower() in a.lower()
             matches = [m for m in matches if t_contains(m)]
 
+        st.success(f"Endpoint usado: {path_used}")
         st.write(f"Partidos obtenidos: {len(matches)}")
 
         progress = st.progress(0)
@@ -297,7 +348,9 @@ if btn_search:
             if demo_mode:
                 odds_block = DEMO_ODDS
             else:
-                odds_block = fetch_odds_for_match(match)
+                odds_block = guess_odds_block(match)
+                if not odds_block:
+                    odds_block = try_fetch_odds_by_id(match)
 
             rows = extract_corner_rows(match, odds_block, min_line=min_line)
             all_rows.extend(rows)
@@ -310,7 +363,6 @@ if btn_search:
         else:
             df = pd.DataFrame(all_rows)
             st.dataframe(df, use_container_width=True)
-
             out_name = f"corners_rapidapi_betodds_{sel_date}.xlsx"
             bio = io.BytesIO()
             with pd.ExcelWriter(bio, engine="openpyxl") as writer:
@@ -331,4 +383,3 @@ if btn_search:
     except Exception as e:
         st.error(f"Ocurrió un error: {e}")
         st.exception(e)
-
