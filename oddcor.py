@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Corners Finder — SportMonks (Totales de corners con dropdowns)
-# --------------------------------------------------------------
+# Corners Finder — SportMonks (Totales de corners con dropdowns + fallback)
+# ------------------------------------------------------------------------
 # Reqs: streamlit, requests, pandas, openpyxl
 
 import io
@@ -19,6 +19,7 @@ st.title("⚽ Corners Finder — SportMonks (Totales de corners)")
 
 # ============================ Helpers ============================
 def api_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrapper de GET con errores claros."""
     r = requests.get(f"{API_BASE}{path}", params=params, timeout=30)
     r.raise_for_status()
     try:
@@ -28,7 +29,7 @@ def api_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_leagues(token: str) -> Dict[str, int]:
-    """Devuelve { 'Liga (ID n)': id }."""
+    """Devuelve { 'Liga (ID n)': id } para el multiselect."""
     data = api_get("/leagues", {"api_token": token}).get("data", [])
     return {f"{l.get('name','Liga')} (ID {l['id']})": l["id"] for l in data if isinstance(l, dict) and "id" in l}
 
@@ -39,25 +40,50 @@ def fixtures_with_odds(
     bookmakers_csv: str
 ) -> List[Dict[str, Any]]:
     """
-    Fixtures del día con odds de 'Alternative Corners' y datos del bookmaker.
-    include=odds,participants,odds.bookmaker para tener nombre del bookmaker.
-    filters=markets:69 (+ opcional fixtureLeagues:{ids}, bookmakers:{ids})
+    Intenta:
+      A) /fixtures/date/{date}
+      B) /fixtures + filters=date:{date}  (fallback si A da 404)
+    Siempre con include=odds,participants,odds.bookmaker y filters=markets:69 (+ opcionales).
     """
-    filters = f"markets:{MARKET_ID_ALTERNATIVE_CORNERS}"
+    base_filters = [f"markets:{MARKET_ID_ALTERNATIVE_CORNERS}"]
     if leagues_csv:
-        filters += f",fixtureLeagues:{leagues_csv}"
+        base_filters.append(f"fixtureLeagues:{leagues_csv}")
     if bookmakers_csv:
-        filters += f",bookmakers:{bookmakers_csv}"
+        base_filters.append(f"bookmakers:{bookmakers_csv}")
+    filters_str = ",".join(base_filters)
 
-    params = {
+    includes = "odds,participants,odds.bookmaker"
+
+    # -------- Intento A: /fixtures/date/{date}
+    try:
+        params_a = {
+            "api_token": token,
+            "include": includes,
+            "filters": filters_str,
+            "tz": "UTC",
+        }
+        resp_a = api_get(f"/fixtures/date/{day.isoformat()}", params_a)
+        data_a = resp_a.get("data", []) if isinstance(resp_a, dict) else []
+        if data_a:
+            return data_a
+    except requests.HTTPError as e:
+        # Pasar al fallback solo si es 404
+        if e.response is None or e.response.status_code != 404:
+            raise
+
+    # -------- Intento B (fallback): /fixtures + filters=date:{date}
+    params_b = {
         "api_token": token,
-        "include": "odds,participants,odds.bookmaker",
-        "filters": filters,
+        "include": includes,
+        "filters": f"date:{day.isoformat()},{filters_str}" if filters_str else f"date:{day.isoformat()}",
+        "tz": "UTC",
     }
-    resp = api_get(f"/fixtures/date/{day.isoformat()}", params)
-    return resp.get("data", []) if isinstance(resp, dict) else []
+    resp_b = api_get("/fixtures", params_b)
+    data_b = resp_b.get("data", []) if isinstance(resp_b, dict) else []
+    return data_b
 
 def fx_name(fx: Dict[str, Any]) -> str:
+    """Construye 'A vs B' desde participants si existe."""
     parts = fx.get("participants", {}).get("data", [])
     names = [p.get("name") for p in parts if isinstance(p, dict)]
     return f"{names[0]} vs {names[1]}" if len(names) >= 2 else (fx.get("name") or f"Fixture {fx.get('id')}")
@@ -70,10 +96,7 @@ with st.sidebar:
     st.header("🌍 Ligas (opcional)")
     if token:
         leagues_dict = get_leagues(token)
-        sel_leagues = st.multiselect(
-            "Selecciona Ligas",
-            list(leagues_dict.keys()),
-        )
+        sel_leagues = st.multiselect("Selecciona Ligas", list(leagues_dict.keys()))
         leagues_csv = ",".join(str(leagues_dict[k]) for k in sel_leagues)
     else:
         leagues_csv = ""
@@ -83,10 +106,9 @@ with st.sidebar:
     # Se llenará después de la primera búsqueda exitosa
     if "available_bookies" not in st.session_state:
         st.session_state.available_bookies = {}  # { 'Nombre (ID n)': id }
-
     if st.session_state.available_bookies:
         sel_bookies = st.multiselect(
-            "Selecciona Casas de Apuesta (de los partidos encontrados)",
+            "Selecciona Casas de Apuesta (detectadas en los partidos)",
             list(st.session_state.available_bookies.keys()),
         )
         bookmakers_csv = ",".join(str(st.session_state.available_bookies[n]) for n in sel_bookies)
@@ -110,7 +132,9 @@ if fetch_btn:
         st.error("Falta API token.")
         st.stop()
 
-    st.write(f"Buscando fixtures del **{the_day.isoformat()}** con mercado **Alternative Corners (ID {MARKET_ID_ALTERNATIVE_CORNERS})**…")
+    st.write(
+        f"Buscando fixtures del **{the_day.isoformat()}** con mercado **Alternative Corners (ID {MARKET_ID_ALTERNATIVE_CORNERS})**…"
+    )
 
     try:
         fixtures = fixtures_with_odds(token, the_day, leagues_csv, bookmakers_csv)
@@ -122,9 +146,9 @@ if fetch_btn:
         st.warning("No se encontraron fixtures (o tu plan no incluye odds para esas ligas/fecha).")
         st.stop()
 
-    # Construir mapa dinámico de bookmakers (según lo que venga en fixtures)
-    bookies_found = {}
-    rows = []
+    # Construir mapa dinámico de bookmakers a partir de lo encontrado
+    bookies_found: Dict[str, int] = {}
+    rows: List[Dict[str, Any]] = []
 
     for fx in fixtures:
         name = fx_name(fx)
@@ -136,31 +160,28 @@ if fetch_btn:
             if o.get("market_id") != MARKET_ID_ALTERNATIVE_CORNERS:
                 continue
 
-            # Nombre del bookmaker si viene incluido
             bk_id = o.get("bookmaker_id")
             bk_name = None
             if isinstance(o.get("bookmaker"), dict):
                 bk_data = o["bookmaker"].get("data")
                 if isinstance(bk_data, dict):
                     bk_name = bk_data.get("name")
-
             if not bk_name:
                 bk_name = f"Bookmaker ID {bk_id}" if bk_id else "Bookmaker"
 
-            # Registrar en el mapa para el dropdown dinámico
             if bk_id:
                 bookies_found[f"{bk_name} (ID {bk_id})"] = bk_id
 
-            # Extraer total/price + etiqueta Over/Under
             total = o.get("total")
             price = o.get("value")
-            label = o.get("label") or o.get("name")
+            label = o.get("label") or o.get("name")  # 'Over' / 'Under'
 
             if total is None or price is None or label not in ("Over", "Under"):
                 continue
 
             try:
-                total = float(total); price = float(price)
+                total = float(total)
+                price = float(price)
             except Exception:
                 continue
 
@@ -204,8 +225,10 @@ if fetch_btn:
     )
 
     # Asegurar columnas
-    if "Over" not in pivot.columns: pivot["Over"] = pd.NA
-    if "Under" not in pivot.columns: pivot["Under"] = pd.NA
+    if "Over" not in pivot.columns:
+        pivot["Over"] = pd.NA
+    if "Under" not in pivot.columns:
+        pivot["Under"] = pd.NA
 
     # Filtro por umbrales
     filtered = pivot[
@@ -229,9 +252,12 @@ if fetch_btn:
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         filtered.to_excel(writer, index=False, sheet_name="corners_totales")
-    st.download_button("⬇️ Descargar Excel", out.getvalue(),
-                       file_name=f"sportmonks_corners_L{str(target).replace('.','_')}_{the_day.isoformat()}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "⬇️ Descargar Excel",
+        out.getvalue(),
+        file_name=f"sportmonks_corners_L{str(target).replace('.','_')}_{the_day.isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Filas", f"{len(filtered):,}")
