@@ -112,9 +112,9 @@ if do_search:
                 }
             else:
                 payload = fetch_event_markets(ev_id, lang)(ev_id, lang)(ev_id, lang)
-            except requests.HTTPError as http_err:
-                # Si el endpoint no tiene mercados aún o no hay permisos, seguimos
-                continue
+            except requests.HTTPError:
+                    # Sin mercados o sin permisos, saltar
+                    continue
             rows = rows_from_markets(ev, payload, min_home_line=min_local, allowed_books=allowed_books)
             all_rows.extend(rows)
 
