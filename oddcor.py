@@ -34,151 +34,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# ===================== CONFIGURACIÓN =====================
-SPORT_ID_SOCCER = 1  # según docs, Soccer = 1
-DEFAULT_LANG = os.getenv("SPORTRADAR_LANGUAGE", "en")
-ACCESS_LEVEL = os.getenv("SPORTRADAR_ACCESS_LEVEL", "trial")
-# Eliminamos lectura directa para usar UI input
-API_KEY = None  # será asignado desde UI("SPORTRADAR_API_KEY", "")
-BASE = "https://api.sportradar.com"
-
-# ===================== HELPERS =====================
-
-def get_secret(key: str, fallback: str = "") -> str:
-    # Usamos API_KEY de la UI
-    if key == "SPORTRADAR_API_KEY":
-        return API_KEY or fallback
-    return fallback(key: str, fallback: str = "") -> str:
-    # Permite leer de st.secrets o de env
-    try:
-        return st.secrets.get(key, os.getenv(key, fallback))
-    except Exception:
-        return os.getenv(key, fallback)
-
-
-def api_get(path: str, params: dict | None = None):
-    if params is None:
-        params = {}
-    api_key = get_secret("SPORTRADAR_API_KEY", API_KEY)
-    if not api_key:
-        raise RuntimeError("Falta SPORTRADAR_API_KEY (en st.secrets o variables de entorno).")
-    params["api_key"] = api_key
-    url = f"{BASE}{path}"
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-
-def sr_date(d: date) -> str:
-    # Formato YYYY-MM-DD
-    return d.strftime("%Y-%m-%d")
-
-
-def list_daily_events(date_obj: date, lang: str) -> list[dict]:
-    """Obtiene eventos con odds disponibles para una fecha (prematch)."""
-    path = f"/oddscomparison-prematch/{ACCESS_LEVEL}/v2/{lang}/sports/{SPORT_ID_SOCCER}/schedules/{sr_date(date_obj)}/schedules.json"
-    data = api_get(path)
-    # La estructura típica incluye una lista de sport_events
-    events = data.get("schedules", [])
-    # Normalizamos a una lista de diccionarios con sport_event y quizá markets_count
-    out = []
-    for item in events:
-        se = item.get("sport_event", {})
-        if not se:
-            continue
-        out.append({
-            "sport_event_id": se.get("id"),
-            "start_time": se.get("start_time"),
-            "status": se.get("status"),
-            "competitors": se.get("competitors", []),
-            "tournament": (se.get("tournament") or {}).get("name"),
-        })
-    return out
-
-
-def team_names_from_competitors(competitors: list[dict]) -> tuple[str, str]:
-    home = away = ""
-    for c in competitors or []:
-        q = c.get("qualifier")
-        if q == "home":
-            home = c.get("name", "")
-        elif q == "away":
-            away = c.get("name", "")
-    return home, away
-
-
-def fetch_event_markets(event_id: str, lang: str) -> dict:
-    path = f"/oddscomparison-prematch/{ACCESS_LEVEL}/v2/{lang}/sport_events/{event_id}/sport_event_markets.json"
-    return api_get(path)
-
-
-CORNER_PAT = re.compile(r"corner", re.IGNORECASE)
-OVER_PAT = re.compile(r"over", re.IGNORECASE)
-UNDER_PAT = re.compile(r"under", re.IGNORECASE)
-
-
-def rows_from_markets(event: dict, markets_payload: dict, min_home_line: float, allowed_books: set[str] | None) -> list[dict]:
-    rows = []
-    se = markets_payload.get("sport_event", {})
-    competitors = se.get("competitors", [])
-    home, away = team_names_from_competitors(competitors)
-
-    for m in markets_payload.get("markets", []) or []:
-        m_name = (m.get("name") or "").strip()
-        if not CORNER_PAT.search(m_name):
-            continue  # sólo mercados que contengan "corner" en el nombre
-
-        for book in m.get("books", []) or []:
-            book_name = (book.get("name") or "").strip()
-            if allowed_books and book_name not in allowed_books:
-                continue
-
-            for outcome in book.get("outcomes", []) or []:
-                odds_dec = outcome.get("odds_decimal")
-                try:
-                    odds_dec = float(odds_dec) if odds_dec is not None else None
-                except Exception:
-                    odds_dec = None
-
-                # Campo handicap (puede ser línea de corners)
-                hcap_raw = outcome.get("handicap")
-                try:
-                    hcap = float(hcap_raw) if hcap_raw is not None and hcap_raw != "" else None
-                except Exception:
-                    hcap = None
-
-                field_id = outcome.get("field_id")  # 1=home, 2=away, 3=home in 1x2?, etc.
-                oname = (outcome.get("name") or "").strip()
-
-                # --- LÓGICA DE FILTRO "Local arriba de N" ---
-                # (A) Mercados tipo totales (Over/Under) de corners para el HOME
-                cond_A = False
-                if hcap is not None and hcap >= min_home_line and OVER_PAT.search(oname):
-                    # Si el mercado es de equipo local, asumimos home total corners
-                    # Heurística: el nombre del mercado incluye "home" o "team home" o similar
-                    if re.search(r"home|local|team\s*A|equipo\s*local", m_name, re.IGNORECASE):
-                        cond_A = True
-
-                # (B) Mercados tipo handicap de corners donde field_id==1 (home) y handicap >= N
-                cond_B = (hcap is not None and hcap >= min_home_line and str(field_id) == "1")
-
-                if cond_A or cond_B:
-                    rows.append({
-                        "sport_event_id": se.get("id"),
-                        "start_time": se.get("start_time"),
-                        "tournament": (se.get("tournament") or {}).get("name"),
-                        "home": home,
-                        "away": away,
-                        "market_name": m_name,
-                        "book": book_name,
-                        "outcome_name": oname,
-                        "handicap": hcap,
-                        "odds_decimal": odds_dec,
-                    })
-    return rows
-
-# ===================== UI =====================
-st.set_page_config(page_title="Corners Finder — Sportradar", page_icon="⚽", layout="wide")
+# (set_page_config movido arriba)
 st.title("⚽ Buscador de partidos con mercados de corners (Sportradar — Prematch)")
 
 # ==== API Key en UI ====
@@ -208,9 +64,32 @@ st.markdown(
     """
 )
 
-if st.button("Buscar partidos con corners"):
+col_btn1, col_btn2 = st.columns([1,1])
+with col_btn1:
+    do_search = st.button("🔍 Buscar partidos con corners")
+with col_btn2:
+    do_ping = st.button("🧪 Probar conexión (ping)")
+
+if do_ping:
     try:
-        events = list_daily_events(fecha, lang)
+        # endpoint muy liviano: status o schedules del día
+        test_date = date.today()
+        _ = list_daily_events(test_date, lang)
+        st.success("Conexión OK y credenciales válidas.")
+        LOG.write(f"Ping OK para {test_date}.")
+    except Exception as e:
+        st.error(f"Ping falló: {e}")
+        LOG.write(f"Ping error: {e}")
+
+if do_search:
+    try:
+        if DEMO_MODE:
+            # Datos simulados para validar UI
+            events = [
+                {"sport_event_id": "demo:1", "start_time": f"{sr_date(fecha)}T18:00:00Z", "status": "not_started", "competitors": [], "tournament": "Demo League"},
+            ]
+        else:
+            events = list_daily_events(fecha, lang)
         st.write(f"Eventos encontrados: {len(events)}")
         all_rows: list[dict] = []
 
@@ -226,6 +105,18 @@ if st.button("Buscar partidos con corners"):
             if not ev_id:
                 continue
             try:
+                if DEMO_MODE:
+                payload = {
+                    "sport_event": {"id": ev_id, "start_time": f"{sr_date(fecha)}T18:00:00Z", "tournament": {"name": "Demo League"},
+                                     "competitors": [{"name": "Equipo A", "qualifier": "home"}, {"name": "Equipo B", "qualifier": "away"}]},
+                    "markets": [
+                        {"name": "Total Home Corners",
+                         "books": [{"name": "DemoBook", "outcomes": [
+                             {"name": "Over", "handicap": 2.0, "odds_decimal": 1.9, "field_id": 1}
+                         ]}]}
+                    ]
+                }
+            else:
                 payload = fetch_event_markets(ev_id, lang)
             except requests.HTTPError as http_err:
                 # Si el endpoint no tiene mercados aún o no hay permisos, seguimos
