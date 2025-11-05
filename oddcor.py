@@ -1,12 +1,25 @@
-# Corners Finder — The Odds API v4
+# Corners Finder — The Odds API v4 (Streamlit)
+# ---------------------------------------------
 # Reqs: streamlit, requests, pandas, openpyxl
-# Doc: https://the-odds-api.com/liveapi/guides/v4/  (v4)
-# Mercados de corners (adicionales): alternate_totals_corners, alternate_spreads_corners
+# Funciones:
+#  - Ingresa API key de The Odds API
+#  - Selecciona fecha (UTC), regiones, y ligas de soccer
+#  - Busca eventos del día y trae mercados de corners por evento
+#  - Filtro: handicap de corners (Local ≥ X)
+#  - Descarga resultados a Excel
+#
+# Notas de API:
+#   - Base: https://api.the-odds-api.com/v4
+#   - /sports                -> lista ligas (group "Soccer")
+#   - /sports/{sport}/events -> eventos (no consume cuota)
+#   - /sports/{sport}/events/{id}/odds?markets=alternate_totals_corners,alternate_spreads_corners
+#       -> mercados adicionales (incluye corners)
+#
+# Importante: el formato de commenceTimeFrom/To debe ser YYYY-MM-DDTHH:MM:SSZ (sin microsegundos)
 
 import io
-import math
 import time
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime, date, time as dtime, timezone
 
 import pandas as pd
 import requests
@@ -14,52 +27,65 @@ import streamlit as st
 
 API_BASE = "https://api.the-odds-api.com/v4"
 
+# ===================== UI BASE =====================
 st.set_page_config(page_title="Corners Finder — The Odds API", page_icon="⚽", layout="wide")
 st.title("⚽ Corners Finder — The Odds API v4")
 
 with st.sidebar:
     st.header("🔑 Configuración")
-    api_key = st.text_input("API key (The Odds API)", type="password")
+    api_key = st.text_input("API key (The Odds API)", type="password", help="Cópiala de tu cuenta en The Odds API")
     odds_format = st.selectbox("Formato de momios", ["decimal", "american"], index=0)
-    # Regiones soportadas (las más comunes en soccer)
-    regions = st.multiselect("Regiones (bookmakers por región)", ["uk", "eu", "us", "us2", "au"], default=["uk","eu"])
-    the_day = st.date_input("Fecha (UTC)", value=date.today())
+    regions = st.multiselect("Regiones (bookmakers)", ["uk", "eu", "us", "us2", "au"], default=["uk", "eu"])
+    the_day = st.date_input("Fecha (UTC)", value=date.today(),
+                            help="La búsqueda usa una ventana de 00:00:00 a 23:59:59 UTC")
     local_handicap_min = st.number_input("Filtro: Handicap corners Local ≥", min_value=0.0, value=2.0, step=0.5)
-    fetch_btn = st.button("Buscar corners")
+    fetch_btn = st.button("🔎 Buscar corners")
 
+# ===================== Helpers =====================
 def _headers():
     return {"Accept": "application/json"}
 
-def _get(url, params, retries=2, backoff=0.6):
+def _get(url, params, retries=2, backoff=0.7):
+    """GET con reintentos básicos para 429/5xx; propaga errores legibles."""
     for i in range(retries + 1):
-        r = requests.get(url, params=params, headers=_headers(), timeout=25)
+        r = requests.get(url, params=params, headers=_headers(), timeout=30)
         if r.status_code == 200:
-            return r.json()
+            # Puede venir JSON o lista
+            try:
+                return r.json()
+            except Exception:
+                raise RuntimeError(f"Respuesta no JSON en {url}")
         if r.status_code in (429, 500, 502, 503, 504) and i < retries:
             time.sleep(backoff * (2 ** i))
             continue
-        # Propaga error legible
         raise RuntimeError(f"{r.status_code} {r.text}")
+
+def iso_utc(dt: datetime) -> str:
+    """Formatea a ISO Z sin microsegundos (YYYY-MM-DDTHH:MM:SSZ)."""
+    return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 @st.cache_data(ttl=1200, show_spinner=False)
 def list_soccer_sports(api_key: str):
-    """Lista ligas de soccer activas (y también puedes marcar 'all')."""
+    """Lista ligas de Soccer, activas primero."""
     url = f"{API_BASE}/sports"
-    # all=true para mostrar también fuera de temporada; filtramos por 'group' Soccer
     data = _get(url, {"apiKey": api_key, "all": "true"})
-    soccer = [s for s in data if "Soccer" in s.get("group","")]
-    # Ordenar por título
-    soccer_sorted = sorted(soccer, key=lambda x: (not x.get("active", False), x.get("title","")))
+    soccer = [s for s in data if "Soccer" in s.get("group", "")]
+    soccer_sorted = sorted(soccer, key=lambda x: (not x.get("active", False), x.get("title", "")))
     return soccer_sorted
 
 @st.cache_data(ttl=600, show_spinner=False)
-def list_events_for_sport(api_key: str, sport_key: str, date_from_iso: str, date_to_iso: str):
-    """Eventos (no incluye momios) — no cuenta a la cuota."""
+def list_events_for_sport(api_key: str, sport_key: str, commence_from_iso: str, commence_to_iso: str):
+    """Eventos del deporte/competición entre dos tiempos (no cuenta a cuota)."""
     url = f"{API_BASE}/sports/{sport_key}/events"
-    return _get(url, {"apiKey": api_key, "commenceTimeFrom": date_from_iso, "commenceTimeTo": date_to_iso})
+    params = {
+        "apiKey": api_key,
+        "commenceTimeFrom": commence_from_iso,
+        "commenceTimeTo": commence_to_iso,
+    }
+    return _get(url, params)
 
 def fetch_event_corners(api_key: str, sport_key: str, event_id: str, regions_csv: str, odds_format: str):
-    """Trae mercados ADICIONALES del evento (corners)."""
+    """Mercados ADICIONALES del evento (corners)."""
     url = f"{API_BASE}/sports/{sport_key}/events/{event_id}/odds"
     markets = "alternate_totals_corners,alternate_spreads_corners"
     params = {
@@ -71,12 +97,12 @@ def fetch_event_corners(api_key: str, sport_key: str, event_id: str, regions_csv
     }
     try:
         return _get(url, params)
-    except Exception as e:
-        # Si un evento no tiene mercados soportados, devolver vacío.
+    except Exception:
+        # Hay eventos sin corners/mercados alternos -> regresa vacío
         return []
 
-def flatten_corners_rows(event, bookie, market):
-    """Convierte un market de corners a filas planas."""
+def flatten_corners_rows(event, bookmaker, market):
+    """Convierte un market de corners en filas planas (una por outcome)."""
     rows = []
     ev_id = event.get("id")
     commence = event.get("commence_time")
@@ -84,48 +110,47 @@ def flatten_corners_rows(event, bookie, market):
     away = event.get("away_team")
     market_key = market.get("key")
     for outc in market.get("outcomes", []):
-        name = outc.get("name")
-        price = outc.get("price")
-        point = outc.get("point")  # puede venir None si no aplica
         rows.append({
             "event_id": ev_id,
             "commence_time": commence,
             "home_team": home,
             "away_team": away,
-            "bookmaker": bookie.get("title"),
+            "bookmaker": bookmaker.get("title"),
             "market_key": market_key,
-            "outcome_name": name,
-            "point": point,
-            "price": price,
-            "last_update": bookie.get("last_update"),
+            "outcome_name": outc.get("name"),
+            "point": outc.get("point"),
+            "price": outc.get("price"),
+            "last_update": bookmaker.get("last_update"),
         })
     return rows
 
-# Paso 1: escoger ligas
+# ===================== Paso 1: ligas =====================
+chosen_sports = []
 if api_key:
     try:
         soccer_list = list_soccer_sports(api_key)
         with st.expander("⚙️ Ligas/competiciones de Soccer (The Odds API)"):
-            # Sugerimos algunas típicas primero
-            default_keys = [s["key"] for s in soccer_list if s.get("active") and any(
-                kw in s.get("title","").lower() for kw in ["premier", "la liga", "serie a", "bundesliga", "ligue 1", "mls"]
-            )]
+            default_keys = [s["key"] for s in soccer_list
+                            if s.get("active") and any(
+                                kw in s.get("title", "").lower()
+                                for kw in ["premier", "la liga", "serie a", "bundesliga", "ligue 1", "mls"]
+                            )]
             options = {f'{s["title"]} — {s["key"]}': s["key"] for s in soccer_list}
-            chosen_labels = st.multiselect("Selecciona ligas (puedes dejar vacío y usar 'upcoming')",
-                                           list(options.keys()),
-                                           default=[l for l in options if options[l] in default_keys][:6])
-            chosen_sports = [options[l] for l in chosen_labels]
-            # Opción universal 'upcoming'
-            use_upcoming = st.checkbox("Usar sport = 'upcoming' (muestra en vivo y próximos)", value=False)
-            if use_upcoming:
+            chosen_labels = st.multiselect(
+                "Selecciona ligas (puedes dejar vacío y usar 'upcoming')",
+                list(options.keys()),
+                default=[lbl for lbl in options if options[lbl] in default_keys][:6]
+            )
+            chosen_sports = [options[lbl] for lbl in chosen_labels]
+            use_upcoming = st.checkbox("Usar sport = 'upcoming' (próximos/en vivo)", value=False)
+            if use_upcoming or not chosen_sports:
                 chosen_sports = ["upcoming"]
     except Exception as e:
         st.warning(f"No pude listar ligas: {e}")
-        soccer_list = []
 else:
     st.info("Ingresa tu API key para listar ligas y eventos.")
 
-# Paso 2: ejecutar búsqueda
+# ===================== Paso 2: búsqueda =====================
 if fetch_btn:
     if not api_key:
         st.error("Falta API key.")
@@ -136,14 +161,11 @@ if fetch_btn:
 
     regions_csv = ",".join(regions)
 
-    # Ventana de la fecha seleccionada en UTC
-    start_iso = datetime.combine(the_day, datetime.min.time()).replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z")
-    end_iso   = (datetime.combine(the_day, datetime.max.time()).replace(tzinfo=timezone.utc)
-                 .isoformat().replace("+00:00","Z"))
-
-    # Si no seleccionaron ligas: usar 'upcoming'
-    if not 'chosen_sports' in locals() or len(chosen_sports) == 0:
-        chosen_sports = ["upcoming"]
+    # Ventana exacta del día seleccionado en UTC (SIN microsegundos)
+    start_dt = datetime.combine(the_day, dtime(0, 0, 0, tzinfo=timezone.utc))
+    end_dt   = datetime.combine(the_day, dtime(23, 59, 59, tzinfo=timezone.utc))
+    start_iso = iso_utc(start_dt)  # e.g., 2025-11-05T00:00:00Z
+    end_iso   = iso_utc(end_dt)    # e.g., 2025-11-05T23:59:59Z
 
     st.write(f"🔍 Buscando eventos entre **{start_iso}** y **{end_iso}** en {', '.join(chosen_sports)} …")
 
@@ -151,48 +173,59 @@ if fetch_btn:
     total_events_checked = 0
 
     for sport in chosen_sports:
+        # 1) Eventos del día
         try:
-            # Listar eventos del día para la liga
             events = list_events_for_sport(api_key, sport, start_iso, end_iso)
         except Exception as e:
             st.warning(f"[{sport}] No pude obtener eventos: {e}")
             events = []
 
-        # Para cada evento, pedir mercados adicionales (corners)
+        # 2) Por cada evento: odds de mercados adicionales (corners)
         for ev in events:
             total_events_checked += 1
             data = fetch_event_corners(api_key, sport, ev["id"], regions_csv, odds_format)
-            # data es lista de bookmakers (o [] si no hay)
+            # data: lista de bookmakers
             for bk in data:
                 for m in bk.get("markets", []):
                     if m.get("key") in ("alternate_totals_corners", "alternate_spreads_corners"):
                         all_rows.extend(flatten_corners_rows(ev, bk, m))
 
     st.write(f"Eventos inspeccionados: **{total_events_checked}**")
+
     if not all_rows:
-        st.warning("No se encontraron mercados de *corners* para la selección. Prueba otras ligas/regiones u otra fecha.")
+        st.warning("No se encontraron mercados de *corners* para la selección. "
+                   "Prueba otras ligas/regiones u otra fecha.")
         st.stop()
 
     df = pd.DataFrame(all_rows)
 
-    # Filtro: handicap de corners Local ≥ X (aplica a alternate_spreads_corners)
-    # Asumimos que en outcomes el 'name' coincide con home_team / away_team y 'point' es el spread.
-    mask_local = (
+    # Filtro: handicap de corners Local ≥ X (sólo para alternate_spreads_corners)
+    # Asumimos outcome_name == home_team cuando corresponde al local.
+    mask_local_handicap = (
         (df["market_key"] == "alternate_spreads_corners") &
         (df["outcome_name"] == df["home_team"]) &
         (pd.to_numeric(df["point"], errors="coerce") >= float(local_handicap_min))
     )
-    df_filtered = pd.concat([df[mask_local], df[df["market_key"] == "alternate_totals_corners"]], ignore_index=True)
+
+    df_filtered = pd.concat(
+        [
+            df[mask_local_handicap],                       # handicaps del local que cumplen el umbral
+            df[df["market_key"] == "alternate_totals_corners"],  # también mostramos totales de corners
+        ],
+        ignore_index=True
+    )
+
+    # Ordenar por fecha -> bookmaker -> point (desc si existe)
+    if "point" in df_filtered.columns:
+        df_filtered = df_filtered.sort_values(
+            by=["commence_time", "bookmaker", "point"],
+            ascending=[True, True, False]
+        )
+    else:
+        df_filtered = df_filtered.sort_values(by=["commence_time", "bookmaker"])
 
     st.subheader("Resultados")
-    st.caption("Se muestran mercados `alternate_spreads_corners` (handicap por equipo) y `alternate_totals_corners` (línea total).")
-
-    # Ordenar: fecha, liga implícita por recorrer sports, luego bookmaker, por punto descendente si existe
-    if "point" in df_filtered.columns:
-        df_filtered = df_filtered.sort_values(by=["commence_time","bookmaker","point"], ascending=[True, True, False])
-    else:
-        df_filtered = df_filtered.sort_values(by=["commence_time","bookmaker"])
-
+    st.caption("Incluye `alternate_spreads_corners` (handicap por equipo) y `alternate_totals_corners` (total corners).")
     st.dataframe(df_filtered, use_container_width=True, hide_index=True)
 
     # Descarga a Excel
@@ -200,10 +233,15 @@ if fetch_btn:
     with io.BytesIO() as buffer:
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df_filtered.to_excel(writer, index=False, sheet_name="corners")
-        st.download_button("⬇️ Descargar Excel", data=buffer.getvalue(), file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button(
+            "⬇️ Descargar Excel",
+            data=buffer.getvalue(),
+            file_name=file_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     # Métricas rápidas
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Filas", f"{len(df_filtered):,}")
-    col2.metric("Bookmakers únicos", df_filtered["bookmaker"].nunique())
-    col3.metric("Eventos con corners", df_filtered["event_id"].nunique())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Filas", f"{len(df_filtered):,}")
+    c2.metric("Bookmakers únicos", df_filtered["bookmaker"].nunique())
+    c3.metric("Eventos con corners", df_filtered["event_id"].nunique())
