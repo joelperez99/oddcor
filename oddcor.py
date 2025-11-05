@@ -83,19 +83,35 @@ if do_ping:
 
 if do_search:
     try:
-        if DEMO_MODE:
+        # --- Obtener payload ---
+            if DEMO_MODE:
+                # Payload demo
                 payload = {
-                    "sport_event": {"id": ev_id, "start_time": f"{sr_date(fecha)}T18:00:00Z", "tournament": {"name": "Demo League"},
-                                     "competitors": [{"name": "Equipo A", "qualifier": "home"}, {"name": "Equipo B", "qualifier": "away"}]},
+                    "sport_event": {
+                        "id": ev_id,
+                        "start_time": f"{sr_date(fecha)}T18:00:00Z",
+                        "tournament": {"name": "Demo League"},
+                        "competitors": [
+                            {"name": "Equipo A", "qualifier": "home"},
+                            {"name": "Equipo B", "qualifier": "away"}
+                        ]
+                    },
                     "markets": [
-                        {"name": "Total Home Corners",
-                         "books": [{"name": "DemoBook", "outcomes": [
-                             {"name": "Over", "handicap": 2.0, "odds_decimal": 1.9, "field_id": 1}
-                         ]}]}
+                        {
+                            "name": "Total Home Corners",
+                            "books": [
+                                {
+                                    "name": "DemoBook",
+                                    "outcomes": [
+                                        {"name": "Over", "handicap": 2.0, "odds_decimal": 1.9, "field_id": 1}
+                                    ]
+                                }
+                            ]
+                        }
                     ]
                 }
             else:
-                payload = fetch_event_markets(ev_id, lang)(ev_id, lang)
+                payload = fetch_event_markets(ev_id, lang)(ev_id, lang)(ev_id, lang)
             except requests.HTTPError as http_err:
                 # Si el endpoint no tiene mercados aún o no hay permisos, seguimos
                 continue
