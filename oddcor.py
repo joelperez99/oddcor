@@ -111,7 +111,10 @@ if do_search:
                     ]
                 }
             else:
-                payload = fetch_event_markets(ev_id, lang)(ev_id, lang)(ev_id, lang)
+                try:
+                payload = fetch_event_markets(ev_id, lang)
+            except requests.HTTPError:
+                continue(ev_id, lang)(ev_id, lang)
             except requests.HTTPError:
                     # Sin mercados o sin permisos, saltar
                     continue
