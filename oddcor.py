@@ -2,23 +2,23 @@
 # ---------------------------------------------
 # Reqs: streamlit, requests, pandas, openpyxl
 # Funciones:
-#  - Ingresa API key de The Odds API
-#  - Selecciona fecha (UTC), regiones, y ligas de soccer
+#  - API key The Odds API
+#  - Fecha (UTC), regiones y ligas de soccer
 #  - Busca eventos del día y trae mercados de corners por evento
 #  - Filtro: handicap de corners (Local ≥ X)
-#  - Descarga resultados a Excel
+#  - Descarga a Excel
 #
-# Notas de API:
-#   - Base: https://api.the-odds-api.com/v4
-#   - /sports                -> lista ligas (group "Soccer")
-#   - /sports/{sport}/events -> eventos (no consume cuota)
-#   - /sports/{sport}/events/{id}/odds?markets=alternate_totals_corners,alternate_spreads_corners
-#       -> mercados adicionales (incluye corners)
-#
-# Importante: el formato de commenceTimeFrom/To debe ser YYYY-MM-DDTHH:MM:SSZ (sin microsegundos)
+# Notas del endpoint de evento:
+#   /v4/sports/{sport}/events/{eventId}/odds?markets=alternate_totals_corners,alternate_spreads_corners
+#   La respuesta puede llegar como:
+#     A) lista de bookmakers: [ { "key": "...", "title": "...", "markets": [...] }, ... ]
+#     B) objeto con "bookmakers": { "bookmakers": [ { ... }, ... ], ... }
+#   Por eso normalizamos antes de iterar.
 
 import io
+import json
 import time
+from typing import Iterable, List, Dict, Any
 from datetime import datetime, date, time as dtime, timezone
 
 import pandas as pd
@@ -33,24 +33,26 @@ st.title("⚽ Corners Finder — The Odds API v4")
 
 with st.sidebar:
     st.header("🔑 Configuración")
-    api_key = st.text_input("API key (The Odds API)", type="password", help="Cópiala de tu cuenta en The Odds API")
+    api_key = st.text_input("API key (The Odds API)", type="password")
     odds_format = st.selectbox("Formato de momios", ["decimal", "american"], index=0)
     regions = st.multiselect("Regiones (bookmakers)", ["uk", "eu", "us", "us2", "au"], default=["uk", "eu"])
-    the_day = st.date_input("Fecha (UTC)", value=date.today(),
-                            help="La búsqueda usa una ventana de 00:00:00 a 23:59:59 UTC")
+    the_day = st.date_input(
+        "Fecha (UTC)",
+        value=date.today(),
+        help="Ventana exacta 00:00:00–23:59:59 UTC"
+    )
     local_handicap_min = st.number_input("Filtro: Handicap corners Local ≥", min_value=0.0, value=2.0, step=0.5)
     fetch_btn = st.button("🔎 Buscar corners")
 
 # ===================== Helpers =====================
-def _headers():
+def _headers() -> Dict[str, str]:
     return {"Accept": "application/json"}
 
-def _get(url, params, retries=2, backoff=0.7):
+def _get(url: str, params: Dict[str, Any], retries: int = 2, backoff: float = 0.7) -> Any:
     """GET con reintentos básicos para 429/5xx; propaga errores legibles."""
     for i in range(retries + 1):
         r = requests.get(url, params=params, headers=_headers(), timeout=30)
         if r.status_code == 200:
-            # Puede venir JSON o lista
             try:
                 return r.json()
             except Exception:
@@ -65,7 +67,7 @@ def iso_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 @st.cache_data(ttl=1200, show_spinner=False)
-def list_soccer_sports(api_key: str):
+def list_soccer_sports(api_key: str) -> List[Dict[str, Any]]:
     """Lista ligas de Soccer, activas primero."""
     url = f"{API_BASE}/sports"
     data = _get(url, {"apiKey": api_key, "all": "true"})
@@ -74,7 +76,7 @@ def list_soccer_sports(api_key: str):
     return soccer_sorted
 
 @st.cache_data(ttl=600, show_spinner=False)
-def list_events_for_sport(api_key: str, sport_key: str, commence_from_iso: str, commence_to_iso: str):
+def list_events_for_sport(api_key: str, sport_key: str, commence_from_iso: str, commence_to_iso: str) -> List[Dict[str, Any]]:
     """Eventos del deporte/competición entre dos tiempos (no cuenta a cuota)."""
     url = f"{API_BASE}/sports/{sport_key}/events"
     params = {
@@ -82,9 +84,11 @@ def list_events_for_sport(api_key: str, sport_key: str, commence_from_iso: str, 
         "commenceTimeFrom": commence_from_iso,
         "commenceTimeTo": commence_to_iso,
     }
-    return _get(url, params)
+    data = _get(url, params)
+    # Siempre devolver lista
+    return data if isinstance(data, list) else []
 
-def fetch_event_corners(api_key: str, sport_key: str, event_id: str, regions_csv: str, odds_format: str):
+def fetch_event_corners(api_key: str, sport_key: str, event_id: str, regions_csv: str, odds_format: str) -> Any:
     """Mercados ADICIONALES del evento (corners)."""
     url = f"{API_BASE}/sports/{sport_key}/events/{event_id}/odds"
     markets = "alternate_totals_corners,alternate_spreads_corners"
@@ -101,7 +105,25 @@ def fetch_event_corners(api_key: str, sport_key: str, event_id: str, regions_csv
         # Hay eventos sin corners/mercados alternos -> regresa vacío
         return []
 
-def flatten_corners_rows(event, bookmaker, market):
+def iter_bookmakers(resp: Any) -> Iterable[Dict[str, Any]]:
+    """
+    Normaliza la respuesta del endpoint de evento a un iterable de 'bookmaker' dicts.
+    Formas esperadas:
+      - Lista: [ {bookmaker}, {bookmaker}, ... ]
+      - Objeto: { "bookmakers": [ {bookmaker}, ... ], ... }
+    """
+    if isinstance(resp, list):
+        for bk in resp:
+            if isinstance(bk, dict):
+                yield bk
+    elif isinstance(resp, dict):
+        bks = resp.get("bookmakers") or resp.get("bookmaker") or []
+        if isinstance(bks, list):
+            for bk in bks:
+                if isinstance(bk, dict):
+                    yield bk
+
+def flatten_corners_rows(event: Dict[str, Any], bookmaker: Dict[str, Any], market: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Convierte un market de corners en filas planas (una por outcome)."""
     rows = []
     ev_id = event.get("id")
@@ -109,7 +131,12 @@ def flatten_corners_rows(event, bookmaker, market):
     home = event.get("home_team")
     away = event.get("away_team")
     market_key = market.get("key")
-    for outc in market.get("outcomes", []):
+    outcomes = market.get("outcomes") if isinstance(market, dict) else None
+    if not isinstance(outcomes, list):
+        return rows
+    for outc in outcomes:
+        if not isinstance(outc, dict):
+            continue
         rows.append({
             "event_id": ev_id,
             "commence_time": commence,
@@ -125,16 +152,18 @@ def flatten_corners_rows(event, bookmaker, market):
     return rows
 
 # ===================== Paso 1: ligas =====================
-chosen_sports = []
+chosen_sports: List[str] = []
 if api_key:
     try:
         soccer_list = list_soccer_sports(api_key)
         with st.expander("⚙️ Ligas/competiciones de Soccer (The Odds API)"):
-            default_keys = [s["key"] for s in soccer_list
-                            if s.get("active") and any(
-                                kw in s.get("title", "").lower()
-                                for kw in ["premier", "la liga", "serie a", "bundesliga", "ligue 1", "mls"]
-                            )]
+            default_keys = [
+                s["key"] for s in soccer_list
+                if s.get("active") and any(
+                    kw in s.get("title", "").lower()
+                    for kw in ["premier", "la liga", "serie a", "bundesliga", "ligue 1", "mls"]
+                )
+            ]
             options = {f'{s["title"]} — {s["key"]}': s["key"] for s in soccer_list}
             chosen_labels = st.multiselect(
                 "Selecciona ligas (puedes dejar vacío y usar 'upcoming')",
@@ -169,8 +198,9 @@ if fetch_btn:
 
     st.write(f"🔍 Buscando eventos entre **{start_iso}** y **{end_iso}** en {', '.join(chosen_sports)} …")
 
-    all_rows = []
+    all_rows: List[Dict[str, Any]] = []
     total_events_checked = 0
+    eventos_con_corners = 0
 
     for sport in chosen_sports:
         # 1) Eventos del día
@@ -183,14 +213,26 @@ if fetch_btn:
         # 2) Por cada evento: odds de mercados adicionales (corners)
         for ev in events:
             total_events_checked += 1
-            data = fetch_event_corners(api_key, sport, ev["id"], regions_csv, odds_format)
-            # data: lista de bookmakers
-            for bk in data:
-                for m in bk.get("markets", []):
-                    if m.get("key") in ("alternate_totals_corners", "alternate_spreads_corners"):
-                        all_rows.extend(flatten_corners_rows(ev, bk, m))
+            resp = fetch_event_corners(api_key, sport, ev.get("id"), regions_csv, odds_format)
 
-    st.write(f"Eventos inspeccionados: **{total_events_checked}**")
+            tuvo_corners = False
+            for bk in iter_bookmakers(resp):
+                markets = bk.get("markets") if isinstance(bk, dict) else None
+                if not isinstance(markets, list):
+                    continue
+                for m in markets:
+                    if not isinstance(m, dict):
+                        continue
+                    mk = m.get("key")
+                    if mk in ("alternate_totals_corners", "alternate_spreads_corners"):
+                        rows = flatten_corners_rows(ev, bk, m)
+                        if rows:
+                            tuvo_corners = True
+                            all_rows.extend(rows)
+            if tuvo_corners:
+                eventos_con_corners += 1
+
+    st.write(f"Eventos inspeccionados: **{total_events_checked}** — con corners: **{eventos_con_corners}**")
 
     if not all_rows:
         st.warning("No se encontraron mercados de *corners* para la selección. "
@@ -200,7 +242,6 @@ if fetch_btn:
     df = pd.DataFrame(all_rows)
 
     # Filtro: handicap de corners Local ≥ X (sólo para alternate_spreads_corners)
-    # Asumimos outcome_name == home_team cuando corresponde al local.
     mask_local_handicap = (
         (df["market_key"] == "alternate_spreads_corners") &
         (df["outcome_name"] == df["home_team"]) &
@@ -209,8 +250,8 @@ if fetch_btn:
 
     df_filtered = pd.concat(
         [
-            df[mask_local_handicap],                       # handicaps del local que cumplen el umbral
-            df[df["market_key"] == "alternate_totals_corners"],  # también mostramos totales de corners
+            df[mask_local_handicap],                                 # handicaps del local que cumplen el umbral
+            df[df["market_key"] == "alternate_totals_corners"],      # totales de corners
         ],
         ignore_index=True
     )
