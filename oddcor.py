@@ -85,7 +85,6 @@ if do_search:
     try:
         # --- Obtener payload ---
             if DEMO_MODE:
-                # Payload demo
                 payload = {
                     "sport_event": {
                         "id": ev_id,
@@ -112,7 +111,9 @@ if do_search:
                 }
             else:
                 try:
-                payload = fetch_event_markets(ev_id, lang)
+                    payload = fetch_event_markets(ev_id, lang)
+                except requests.HTTPError:
+                    continue(ev_id, lang)
             except requests.HTTPError:
                 continue(ev_id, lang)(ev_id, lang)
             except requests.HTTPError:
